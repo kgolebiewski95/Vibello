@@ -1,11 +1,21 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
+import { pingHealth } from '../lib/api';
 
-const LAVENDER = '#a886ddff';   // your brand color
+const LAVENDER = '#a886ddff';   // brand color
 const DARK_PURPLE = '#20093A';
 
 export default function UploadPage() {
   const [files, setFiles] = useState([]); // {file, previewUrl}
+  const [apiOnline, setApiOnline] = useState(null); // null | true | false
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    pingHealth(ctrl.signal)
+      .then((ok) => setApiOnline(ok))
+      .catch(() => setApiOnline(false));
+    return () => ctrl.abort();
+  }, []);
 
   const onDrop = useCallback((accepted) => {
     const mapped = accepted.map((file) => ({
@@ -13,7 +23,6 @@ export default function UploadPage() {
       previewUrl: URL.createObjectURL(file),
       id: `${file.name}-${file.size}-${file.lastModified}`,
     }));
-    // cap at 25 for free tier
     setFiles((prev) => [...prev, ...mapped].slice(0, 25));
   }, []);
 
@@ -24,11 +33,8 @@ export default function UploadPage() {
     multiple: true,
   });
 
-  // Clean up object URLs to avoid memory leaks
   useEffect(() => {
-    return () => {
-      files.forEach((f) => URL.revokeObjectURL(f.previewUrl));
-    };
+    return () => files.forEach((f) => URL.revokeObjectURL(f.previewUrl));
   }, [files]);
 
   const removeFile = (id) => setFiles((prev) => prev.filter((f) => f.id !== id));
@@ -38,14 +44,25 @@ export default function UploadPage() {
   };
 
   return (
-    <div
-      className="min-h-screen p-8"
-      style={{ backgroundColor: LAVENDER, color: DARK_PURPLE }}
-    >
+    <div className="min-h-screen p-8" style={{ backgroundColor: LAVENDER, color: DARK_PURPLE }}>
       <div className="max-w-5xl mx-auto">
-        <header className="mb-6">
-          <h1 className="text-3xl font-bold">Vibello — Upload & Preview</h1>
-          <p className="opacity-80">Free: up to 25 photos, with watermark later.</p>
+        <header className="mb-6 flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">Vibello — Upload & Preview</h1>
+            <p className="opacity-80">Free: up to 25 photos, with watermark later.</p>
+          </div>
+          <div
+            title={apiOnline === null ? 'Checking API…' : apiOnline ? 'API online' : 'API offline'}
+            className="px-3 py-1 rounded-full text-sm font-medium"
+            style={{
+              background: apiOnline === null ? '#eee'
+                        : apiOnline ? '#16a34a' /* green-600 */
+                        : '#dc2626' /* red-600 */,
+              color: 'white',
+            }}
+          >
+            API: {apiOnline === null ? 'Checking…' : apiOnline ? 'Online' : 'Offline'}
+          </div>
         </header>
 
         <section
@@ -91,11 +108,7 @@ export default function UploadPage() {
               {files.map((f) => (
                 <li key={f.id} className="bg-white rounded-xl overflow-hidden shadow">
                   <div className="aspect-[4/3] overflow-hidden">
-                    <img
-                      src={f.previewUrl}
-                      alt={f.file.name}
-                      className="w-full h-full object-cover"
-                    />
+                    <img src={f.previewUrl} alt={f.file.name} className="w-full h-full object-cover" />
                   </div>
                   <div className="p-2 flex items-center justify-between">
                     <span className="text-xs truncate max-w-[70%]" title={f.file.name}>
