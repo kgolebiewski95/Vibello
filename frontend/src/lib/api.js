@@ -1,4 +1,4 @@
-// frontend/src/lib/api.js
+// src/lib/api.js
 export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export async function pingHealth(signal) {
@@ -8,24 +8,20 @@ export async function pingHealth(signal) {
   return data?.status === 'ok';
 }
 
-// Upload files with a progress callback (0–100)
 export function uploadFiles(files, onProgress) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
-    // Accept either raw File[] or our {file, previewUrl}[]
     files.forEach((f) => form.append('files', f.file ? f.file : f));
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${API_URL}/api/upload`);
     xhr.responseType = 'json';
-
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && typeof onProgress === 'function') {
         const pct = Math.round((e.loaded / e.total) * 100);
         onProgress(pct);
       }
     };
-
     xhr.onerror = () => reject(new Error('Network error during upload.'));
     xhr.onload = () => {
       const ok = xhr.status >= 200 && xhr.status < 300;
@@ -33,7 +29,6 @@ export function uploadFiles(files, onProgress) {
       const message = xhr.response?.detail || `Upload failed (${xhr.status})`;
       reject(new Error(message));
     };
-
     xhr.send(form);
   });
 }
@@ -42,4 +37,21 @@ export async function getJob(jobId) {
   const res = await fetch(`${API_URL}/api/job/${jobId}`);
   if (!res.ok) throw new Error('Job not found');
   return res.json();
+}
+
+// --- NEW: render helpers ---
+export async function startRender(jobId) {
+  const res = await fetch(`${API_URL}/api/render`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId }),
+  });
+  if (!res.ok) throw new Error('Render start failed');
+  return res.json(); // {render_id, status}
+}
+
+export async function fetchRenderStatus(renderId) {
+  const res = await fetch(`${API_URL}/api/render/${renderId}/status`);
+  if (!res.ok) throw new Error('Render status not found');
+  return res.json(); // {status, progress, download_url, error}
 }
