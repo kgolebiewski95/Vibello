@@ -1,2 +1,4 @@
 storage/tmp/*
 !storage/tmp/.gitkeep
+storage/renders/*
+!storage/renders/.gitkeep
