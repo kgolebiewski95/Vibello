@@ -1,25 +1,46 @@
+// frontend/src/pages/UploadPage.jsx
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { pingHealth, uploadFiles, getJob, startRender, fetchRenderStatus, API_URL } from '../lib/api';
+import {
+  pingHealth,
+  uploadFiles,
+  getJob,
+  startRender,
+  fetchRenderStatus,
+  API_URL,
+} from '../lib/api';
+import {
+  SignedIn,
+  SignedOut,
+  SignInButton,
+  UserButton,
+  useUser,
+} from '@clerk/clerk-react';
 
 const LAVENDER = '#a886ddff';
 const DARK_PURPLE = '#20093A';
-const DEFAULT_XFADE = 0.8; // matches backend default
+const MAX_FILES = 25;
+const DEFAULT_XFADE = 0.8;
 
 export default function UploadPage() {
+  // Auth (optional: user id sent to backend if signed in)
+  const { user, isSignedIn } = useUser();
+
+  // Local state
   const [files, setFiles] = useState([]);
   const [apiOnline, setApiOnline] = useState(null);
 
   const [isUploading, setIsUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [uploadError, setUploadError] = useState('');
+
   const [job, setJob] = useState(null);
 
-  // NEW: user control
+  // User controls
   const [slideSeconds, setSlideSeconds] = useState(3.0);
-  const [xfadeSeconds, setXfadeSeconds]   = useState(0.8);
-  
-  // render states
+  const [xfadeSeconds, setXfadeSeconds] = useState(DEFAULT_XFADE);
+
+  // Render state
   const [renderId, setRenderId] = useState(null);
   const [renderStatus, setRenderStatus] = useState(null);
   const [renderPct, setRenderPct] = useState(0);
@@ -27,50 +48,79 @@ export default function UploadPage() {
   const [downloadUrl, setDownloadUrl] = useState('');
   const pollRef = useRef(null);
 
+  // Health ping
   useEffect(() => {
     const ctrl = new AbortController();
-    pingHealth(ctrl.signal).then(setApiOnline).catch(() => setApiOnline(false));
+    pingHealth(ctrl.signal)
+      .then(() => setApiOnline(true))
+      .catch(() => setApiOnline(false));
     return () => ctrl.abort();
   }, []);
 
+  // Dropzone
   const onDrop = useCallback((accepted) => {
     const mapped = accepted.map((file) => ({
       file,
       previewUrl: URL.createObjectURL(file),
       id: `${file.name}-${file.size}-${file.lastModified}`,
     }));
-    setFiles((prev) => [...prev, ...mapped].slice(0, 25));
-    setJob(null); setRenderId(null); setRenderStatus(null);
-    setDownloadUrl(''); setRenderErr(''); setUploadError('');
-    setUploadPct(0); setRenderPct(0);
+    setFiles((prev) => [...prev, ...mapped].slice(0, MAX_FILES));
+    // reset flow
+    setJob(null);
+    setRenderId(null);
+    setRenderStatus(null);
+    setDownloadUrl('');
+    setRenderErr('');
+    setUploadError('');
+    setUploadPct(0);
+    setRenderPct(0);
   }, []);
 
-  const { getRootProps, getInputProps, isDragActive, fileRejections } = useDropzone({
-    onDrop, accept: { 'image/*': [] }, maxFiles: 25, multiple: true,
-  });
+  const { getRootProps, getInputProps, isDragActive, fileRejections } =
+    useDropzone({
+      onDrop,
+      accept: { 'image/*': [] },
+      maxFiles: MAX_FILES,
+      multiple: true,
+    });
 
-  useEffect(() => () => files.forEach(f => URL.revokeObjectURL(f.previewUrl)), [files]);
+  // Revoke object URLs on unmount
+  useEffect(() => {
+    return () => files.forEach((f) => URL.revokeObjectURL(f.previewUrl));
+  }, [files]);
 
+  // Helpers
   const removeFile = (id) => setFiles((prev) => prev.filter((f) => f.id !== id));
+
   const clearAll = () => {
-    files.forEach(f => URL.revokeObjectURL(f.previewUrl));
-    setFiles([]); setJob(null); setRenderId(null);
-    setRenderStatus(null); setDownloadUrl('');
-    setUploadError(''); setRenderErr('');
-    setUploadPct(0); setRenderPct(0);
+    files.forEach((f) => URL.revokeObjectURL(f.previewUrl));
+    setFiles([]);
+    setJob(null);
+    setRenderId(null);
+    setRenderStatus(null);
+    setDownloadUrl('');
+    setUploadError('');
+    setRenderErr('');
+    setUploadPct(0);
+    setRenderPct(0);
   };
 
   const handleUpload = async () => {
     if (!files.length || isUploading) return;
     setIsUploading(true);
-    setUploadPct(0); setUploadError(''); setJob(null);
-    setRenderId(null); setRenderStatus(null); setDownloadUrl('');
+    setUploadPct(0);
+    setUploadError('');
+    setJob(null);
+    setRenderId(null);
+    setRenderStatus(null);
+    setDownloadUrl('');
     try {
-      const resp = await uploadFiles(files, pct => setUploadPct(pct));
+      const resp = await uploadFiles(files, (pct) => setUploadPct(pct));
       setJob(resp);
       setUploadPct(100);
     } catch (e) {
-      setUploadError(e.message || 'Upload failed'); setUploadPct(0);
+      setUploadError(e.message || 'Upload failed');
+      setUploadPct(0);
     } finally {
       setIsUploading(false);
     }
@@ -78,17 +128,25 @@ export default function UploadPage() {
 
   const estimateSeconds = (n, slide, xfade) => {
     if (!n) return 0;
-    return Math.max(n * slide - (n - 1) * xfade, 0).toFixed(1);
+    const xf = Math.min(xfade, slide - 0.1);
+    return Math.max(n * slide - (n - 1) * xf, 0).toFixed(1);
   };
 
   const handleStartRender = async () => {
-    if (!job?.job_id || renderStatus === 'processing' || renderStatus === 'queued') return;
-    setRenderErr(''); setRenderPct(0);
+    if (!job?.job_id || renderStatus === 'processing' || renderStatus === 'queued')
+      return;
+    setRenderErr('');
+    setRenderPct(0);
+
+    const xf = Math.min(xfadeSeconds, slideSeconds - 0.1);
+
     try {
       const r = await startRender(job.job_id, {
         slide_seconds: slideSeconds,
-        xfade_seconds: Math.min(xfadeSeconds, slideSeconds - 0.1),
-      });  // <-- send the value
+        xfade_seconds: xf,
+        // send user id if signed in; backend currently treats missing as "anon"
+        user_id: isSignedIn ? user.id : undefined,
+      });
       setRenderId(r.render_id);
       setRenderStatus(r.status || 'queued');
 
@@ -104,36 +162,79 @@ export default function UploadPage() {
             pollRef.current = null;
             if (s.error) setRenderErr(s.error);
           }
-        } catch { /* ignore transient errors */ }
-      }, 500);
+        } catch {
+          // ignore transient polling errors
+        }
+      }, 600);
     } catch (e) {
       setRenderErr(e.message || 'Could not start render');
     }
   };
 
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  useEffect(
+    () => () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    },
+    []
+  );
 
   return (
-    <div className="min-h-screen p-8" style={{ backgroundColor: LAVENDER, color: DARK_PURPLE }}>
+    <div
+      className="min-h-screen p-8"
+      style={{ backgroundColor: LAVENDER, color: DARK_PURPLE }}
+    >
       <div className="max-w-5xl mx-auto">
+        {/* Header */}
         <header className="mb-6 flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold">Vibello — Upload & Preview</h1>
-            <p className="opacity-80">Free: up to 25 photos, with watermark later.</p>
+            <p className="opacity-80">
+              Free: up to {MAX_FILES} photos. Watermark + music added automatically.
+            </p>
           </div>
-          <div
-            className="px-3 py-1 rounded-full text-sm font-medium"
-            title={apiOnline === null ? 'Checking API…' : apiOnline ? 'API online' : 'API offline'}
-            style={{ background: apiOnline === null ? '#eee' : apiOnline ? '#16a34a' : '#dc2626', color: 'white' }}
-          >
-            API: {apiOnline === null ? 'Checking…' : apiOnline ? 'Online' : 'Offline'}
+
+          <div className="flex items-center gap-3">
+            <div
+              className="px-3 py-1 rounded-full text-sm font-medium"
+              title={
+                apiOnline === null
+                  ? 'Checking API…'
+                  : apiOnline
+                  ? 'API online'
+                  : 'API offline'
+              }
+              style={{
+                background:
+                  apiOnline === null ? '#bdbdbd' : apiOnline ? '#16a34a' : '#dc2626',
+                color: 'white',
+              }}
+            >
+              API: {apiOnline === null ? 'Checking…' : apiOnline ? 'Online' : 'Offline'}
+            </div>
+
+            <SignedOut>
+              <SignInButton mode="modal">
+                <button
+                  className="px-3 py-1 rounded-lg"
+                  style={{ backgroundColor: DARK_PURPLE, color: 'white' }}
+                >
+                  Sign in
+                </button>
+              </SignInButton>
+            </SignedOut>
+            <SignedIn>
+              <UserButton />
+            </SignedIn>
           </div>
         </header>
 
+        {/* Dropzone */}
         <section
-          {...getRootProps({ className: 'rounded-2xl border-2 border-dashed transition-all p-10 text-center cursor-pointer' })}
+          {...getRootProps({
+            className:
+              'rounded-2xl border-2 border-dashed transition-all p-10 text-center cursor-pointer bg-white',
+          })}
           style={{
-            background: 'white',
             borderColor: isDragActive ? DARK_PURPLE : '#bda7e6',
             boxShadow: isDragActive ? '0 0 0 4px rgba(32,9,58,0.15)' : 'none',
           }}
@@ -144,7 +245,7 @@ export default function UploadPage() {
               {isDragActive ? 'Drop photos to add them' : 'Drag & drop photos here'}
             </p>
             <p className="text-sm opacity-70">…or click to browse. Images only.</p>
-            <p className="text-sm font-medium">{files.length}/25 selected</p>
+            <p className="text-sm font-medium">{files.length}/{MAX_FILES} selected</p>
             {fileRejections?.length > 0 && (
               <p className="text-sm" style={{ color: '#8a1c1c' }}>
                 Some files were rejected (not images or over the limit).
@@ -153,14 +254,18 @@ export default function UploadPage() {
           </div>
         </section>
 
-        {/* NEW: Controls */}
+        {/* Controls */}
         <div className="mt-4 bg-white rounded-xl p-4 shadow grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center gap-4">
             <label className="text-sm font-medium">
-              Time per photo: <span className="font-bold">{slideSeconds.toFixed(1)}s</span>
+              Time per photo:&nbsp;
+              <span className="font-bold">{slideSeconds.toFixed(1)}s</span>
             </label>
             <input
-              type="range" min="1" max="8" step="0.1"
+              type="range"
+              min="1"
+              max="8"
+              step="0.1"
               value={slideSeconds}
               onChange={(e) => setSlideSeconds(parseFloat(e.target.value))}
               className="w-64"
@@ -168,26 +273,35 @@ export default function UploadPage() {
           </div>
           <div className="flex items-center gap-4">
             <label className="text-sm font-medium">
-              Cross-fade: <span className="font-bold">{xfadeSeconds.toFixed(1)}s</span>
+              Cross-fade:&nbsp;
+              <span className="font-bold">
+                {Math.min(xfadeSeconds, slideSeconds - 0.1).toFixed(1)}s
+              </span>
             </label>
             <input
-              type="range" min="0.2" max={Math.max(0.3, slideSeconds - 0.1)} step="0.1"
+              type="range"
+              min="0.2"
+              max={Math.max(0.3, slideSeconds - 0.1)}
+              step="0.1"
               value={Math.min(xfadeSeconds, slideSeconds - 0.1)}
               onChange={(e) => setXfadeSeconds(parseFloat(e.target.value))}
               className="w-64"
             />
           </div>
           <div className="col-span-1 md:col-span-2 text-xs opacity-70">
-            Estimated video length: <b>
-              {files.length
-                ? Math.max(files.length * slideSeconds - (files.length - 1) * Math.min(xfadeSeconds, slideSeconds - 0.1), 0).toFixed(1)
-                : '0.0'}
+            Estimated video length:&nbsp;
+            <b>
+              {estimateSeconds(
+                files.length,
+                slideSeconds,
+                Math.min(xfadeSeconds, slideSeconds - 0.1)
+              )}
               s
             </b>
           </div>
         </div>
 
-
+        {/* Actions */}
         {files.length > 0 && (
           <>
             <div className="flex items-center justify-between mt-6 gap-3">
@@ -196,7 +310,9 @@ export default function UploadPage() {
                 <button
                   className="px-4 py-2 rounded-xl"
                   onClick={clearAll}
-                  disabled={isUploading || renderStatus === 'processing' || renderStatus === 'queued'}
+                  disabled={
+                    isUploading || renderStatus === 'processing' || renderStatus === 'queued'
+                  }
                   style={{ backgroundColor: '#eee', color: DARK_PURPLE }}
                 >
                   Clear all
@@ -205,7 +321,11 @@ export default function UploadPage() {
                   className="px-4 py-2 rounded-xl"
                   onClick={handleUpload}
                   disabled={isUploading || !files.length || !apiOnline}
-                  style={{ backgroundColor: DARK_PURPLE, color: 'white', opacity: isUploading || !apiOnline ? 0.7 : 1 }}
+                  style={{
+                    backgroundColor: DARK_PURPLE,
+                    color: 'white',
+                    opacity: isUploading || !apiOnline ? 0.7 : 1,
+                  }}
                   title={!apiOnline ? 'Backend offline' : 'Upload selected photos'}
                 >
                   {isUploading ? 'Uploading…' : `Upload ${files.length} photo(s)`}
@@ -214,10 +334,16 @@ export default function UploadPage() {
                   className="px-4 py-2 rounded-xl"
                   onClick={handleStartRender}
                   disabled={!job?.job_id || renderStatus === 'processing' || renderStatus === 'queued'}
-                  style={{ backgroundColor: DARK_PURPLE, color: 'white', opacity: !job?.job_id ? 0.5 : 1 }}
+                  style={{
+                    backgroundColor: DARK_PURPLE,
+                    color: 'white',
+                    opacity: !job?.job_id ? 0.5 : 1,
+                  }}
                   title={!job?.job_id ? 'Upload first to get a job_id' : 'Render slideshow'}
                 >
-                  {renderStatus === 'processing' || renderStatus === 'queued' ? 'Rendering…' : 'Render slideshow'}
+                  {renderStatus === 'processing' || renderStatus === 'queued'
+                    ? 'Rendering…'
+                    : 'Render slideshow'}
                 </button>
               </div>
             </div>
@@ -226,35 +352,70 @@ export default function UploadPage() {
               <div className="mt-3 bg-white rounded-xl p-3 shadow">
                 <div className="text-sm mb-1">Upload progress: {uploadPct}%</div>
                 <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden">
-                  <div className="h-3" style={{ width: `${uploadPct}%`, background: DARK_PURPLE, transition: 'width 200ms' }} />
+                  <div
+                    className="h-3"
+                    style={{
+                      width: `${uploadPct}%`,
+                      background: DARK_PURPLE,
+                      transition: 'width 200ms',
+                    }}
+                  />
                 </div>
-                {uploadError && <div className="mt-2 text-sm" style={{ color: '#8a1c1c' }}>{uploadError}</div>}
+                {uploadError && (
+                  <div className="mt-2 text-sm" style={{ color: '#8a1c1c' }}>
+                    {uploadError}
+                  </div>
+                )}
               </div>
             )}
 
-            {(renderStatus && renderStatus !== 'done') && (
+            {renderStatus && renderStatus !== 'done' && (
               <div className="mt-3 bg-white rounded-xl p-3 shadow">
-                <div className="text-sm mb-1">Render status: {renderStatus} — {renderPct}%</div>
-                <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden">
-                  <div className="h-3" style={{ width: `${renderPct}%`, background: DARK_PURPLE, transition: 'width 200ms' }} />
+                <div className="text-sm mb-1">
+                  Render status: {renderStatus} — {renderPct}%
                 </div>
-                {renderErr && <div className="mt-2 text-sm" style={{ color: '#8a1c1c' }}>{renderErr}</div>}
+                <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden">
+                  <div
+                    className="h-3"
+                    style={{
+                      width: `${renderPct}%`,
+                      background: DARK_PURPLE,
+                      transition: 'width 200ms',
+                    }}
+                  />
+                </div>
+                {renderErr && (
+                  <div className="mt-2 text-sm" style={{ color: '#8a1c1c' }}>
+                    {renderErr}
+                  </div>
+                )}
               </div>
             )}
 
+            {/* Thumbnails */}
             <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 mt-4">
               {files.map((f) => (
                 <li key={f.id} className="bg-white rounded-xl overflow-hidden shadow">
                   <div className="aspect-[4/3] overflow-hidden">
-                    <img src={f.previewUrl} alt={f.file.name} className="w-full h-full object-cover" />
+                    <img
+                      src={f.previewUrl}
+                      alt={f.file.name}
+                      className="w-full h-full object-cover"
+                    />
                   </div>
                   <div className="p-2 flex items-center justify-between">
-                    <span className="text-xs truncate max-w-[70%]" title={f.file.name}>{f.file.name}</span>
+                    <span className="text-xs truncate max-w-[70%]" title={f.file.name}>
+                      {f.file.name}
+                    </span>
                     <button
                       className="text-xs px-2 py-1 rounded-lg"
                       onClick={() => removeFile(f.id)}
                       style={{ backgroundColor: '#eee', color: DARK_PURPLE }}
-                      disabled={isUploading || renderStatus === 'processing' || renderStatus === 'queued'}
+                      disabled={
+                        isUploading ||
+                        renderStatus === 'processing' ||
+                        renderStatus === 'queued'
+                      }
                     >
                       Remove
                     </button>
@@ -265,14 +426,18 @@ export default function UploadPage() {
           </>
         )}
 
+        {/* Done */}
         {renderStatus === 'done' && downloadUrl && (
           <div className="mt-6 bg-white rounded-xl p-4 shadow">
             <div className="font-semibold">Render complete</div>
-            <div className="text-sm mt-1">render_id: <code>{renderId}</code></div>
+            <div className="text-sm mt-1">
+              render_id: <code>{renderId}</code>
+            </div>
             <a
               className="inline-block mt-3 px-3 py-2 rounded-lg"
               href={downloadUrl}
-              target="_blank" rel="noreferrer"
+              target="_blank"
+              rel="noreferrer"
               style={{ backgroundColor: DARK_PURPLE, color: 'white' }}
             >
               Download MP4
