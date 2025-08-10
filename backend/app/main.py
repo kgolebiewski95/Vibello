@@ -1,56 +1,77 @@
 # backend/app/main.py
+from __future__ import annotations
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from typing import List
 from pydantic import BaseModel
-from uuid import uuid4
+from typing import List, Optional
 from pathlib import Path
-import shutil
 import asyncio
+import shutil
+import subprocess
+import tempfile
+import uuid
 
-# ----- slideshow config (MVP) -----
-FPS = 30
-SLIDE_SECONDS = 3.0         # per photo (before cross-fade starts)
-XFADE_SECONDS = 0.8         # cross-fade duration between slides
-ZMAX = 1.20                 # max zoom 1.0->1.20
-ZINCR = (ZMAX - 1.0) / (SLIDE_SECONDS * FPS)  # per-frame zoom increment
+# =========================
+# Config (defaults; overridable in /api/render)
+# =========================
+APP_NAME = "Vibello API"
+APP_VERSION = "0.2.1"
 
-app = FastAPI(title="Vibello API", version="0.1.0")
+CORS_ORIGINS = ["http://localhost:5173"]
 
+FPS_DEFAULT = 30
+SLIDE_SECONDS_DEFAULT = 3.0
+XFADE_SECONDS_DEFAULT = 0.8
+
+FREE_TIER = True
+WATERMARK_TEXT = "Made with Vibello"
+
+MAX_FILES = 25
+ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# Paths
+ROOT = Path(__file__).resolve().parent.parent      # backend/
+STORAGE = ROOT / "storage"
+TMP_DIR = STORAGE / "tmp"
+RENDERS_DIR = STORAGE / "renders"
+ASSETS_DIR = ROOT / "assets"
+MUSIC_FILE = ASSETS_DIR / "music" / "default.mp3"
+
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+RENDERS_DIR.mkdir(parents=True, exist_ok=True)
+ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+# =========================
+# App
+# =========================
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- storage paths ---
-ROOT = Path(__file__).resolve().parent.parent  # backend/
-STORAGE = ROOT / "storage"
-TMP_DIR = STORAGE / "tmp"
-RENDERS_DIR = STORAGE / "renders"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-RENDERS_DIR.mkdir(parents=True, exist_ok=True)
-
-# serve /storage/* files (so browser can download results)
 app.mount("/storage", StaticFiles(directory=STORAGE), name="storage")
 
-# --- health/version ---
+# =========================
+# Health
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.get("/api/version")
 def version():
-    return {"name": "vibello", "version": "0.1.0"}
+    return {"name": "vibello", "version": APP_VERSION}
 
-# --- uploads ---
-MAX_FILES = 25
-
+# =========================
+# Upload
+# =========================
 def _safe_name(name: str) -> str:
-    return Path(name).name.replace("\x00", "")
+    return Path(name or "image").name.replace("\x00", "")
 
 @app.post("/api/upload")
 async def upload_images(files: List[UploadFile] = File(...)):
@@ -59,7 +80,7 @@ async def upload_images(files: List[UploadFile] = File(...)):
     if len(files) > MAX_FILES:
         raise HTTPException(status_code=400, detail=f"Limit {MAX_FILES} files.")
 
-    job_id = str(uuid4())
+    job_id = str(uuid.uuid4())
     job_dir = TMP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -68,26 +89,18 @@ async def upload_images(files: List[UploadFile] = File(...)):
         if not (f.content_type and f.content_type.startswith("image/")):
             skipped.append({"name": f.filename, "reason": "not-an-image"})
             continue
-        safe = _safe_name(f.filename or "image")
-        target = job_dir / safe
-        with target.open("wb") as out:
+        safe = _safe_name(f.filename)
+        with (job_dir / safe).open("wb") as out:
             shutil.copyfileobj(f.file, out)
         saved.append({"name": safe, "relpath": f"/storage/tmp/{job_id}/{safe}"})
 
     if not saved:
-        try:
-            job_dir.rmdir()
-        except Exception:
-            pass
+        try: job_dir.rmdir()
+        except Exception: pass
         raise HTTPException(status_code=400, detail="No valid image files.")
 
-    return {
-        "job_id": job_id,
-        "saved_count": len(saved),
-        "skipped_count": len(skipped),
-        "saved": saved,
-        "skipped": skipped,
-    }
+    return {"job_id": job_id, "saved_count": len(saved), "skipped_count": len(skipped),
+            "saved": saved, "skipped": skipped}
 
 @app.get("/api/job/{job_id}")
 def get_job(job_id: str):
@@ -97,20 +110,33 @@ def get_job(job_id: str):
     files = sorted(p.name for p in job_dir.iterdir() if p.is_file())
     return {"job_id": job_id, "files": files}
 
-# --- render skeleton ---
+# =========================
+# Render API
+# =========================
 class RenderRequest(BaseModel):
-    job_id: str  # the uploaded images job to render
+    job_id: str
+    slide_seconds: Optional[float] = None
+    xfade_seconds: Optional[float] = None
+    fps: Optional[int] = None
 
-# simple in-memory render state
-RENDERS: dict[str, dict] = {}  # render_id -> {status, progress, job_id, output, error}
+RENDERS: dict[str, dict] = {}  # render_id -> {status, progress, job_id, output, error, cfg}
 
 @app.post("/api/render")
 async def start_render(req: RenderRequest):
     job_dir = TMP_DIR / req.job_id
-    if not job_dir.exists() or not any(job_dir.iterdir()):
-        raise HTTPException(status_code=404, detail="job_id not found or empty")
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="job_id not found")
 
-    render_id = str(uuid4())
+    images = [p for p in job_dir.iterdir() if p.suffix.lower() in ALLOWED_EXTS]
+    if not images:
+        raise HTTPException(status_code=400, detail="No images found for this job_id")
+
+    fps = max(12, min(60, int(req.fps or FPS_DEFAULT)))
+    slide_s = max(1.0, min(12.0, float(req.slide_seconds or SLIDE_SECONDS_DEFAULT)))
+    xfade_s = float(req.xfade_seconds or XFADE_SECONDS_DEFAULT)
+    xfade_s = max(0.2, min(slide_s - 0.1, xfade_s))  # must be shorter than slide
+
+    render_id = str(uuid.uuid4())
     out_file = RENDERS_DIR / f"{render_id}.mp4"
     RENDERS[render_id] = {
         "status": "queued",
@@ -118,6 +144,7 @@ async def start_render(req: RenderRequest):
         "job_id": req.job_id,
         "output": str(out_file),
         "error": None,
+        "cfg": {"fps": fps, "slide_s": slide_s, "xfade_s": xfade_s},
     }
 
     asyncio.create_task(_render_worker(render_id, out_file))
@@ -131,114 +158,230 @@ def render_status(render_id: str):
     download_url = None
     if info["status"] == "done":
         download_url = f"/storage/renders/{Path(info['output']).name}"
-    return {
-        "render_id": render_id,
-        "status": info["status"],
-        "progress": info["progress"],
-        "download_url": download_url,
-        "error": info["error"],
-    }
+    return {"render_id": render_id, "status": info["status"], "progress": info["progress"],
+            "download_url": download_url, "error": info["error"]}
 
-import subprocess, tempfile
+# =========================
+# Helper funcs
+# =========================
+def _run(args: list[str]):
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-async def _render_worker(render_id: str, out_file: Path):
-    """Render a real slideshow: per-image Ken Burns clips -> chain with xfade."""
+def _dominant_color(image_path: Path) -> tuple[int,int,int]:
+    """Fast approximate dominant color (average of downscaled image)."""
     try:
-        RENDERS[render_id]["status"] = "processing"
-        RENDERS[render_id]["progress"] = 5
+        from PIL import Image, ImageStat
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            im = im.resize((50, 50))
+            r, g, b = [int(x) for x in ImageStat.Stat(im).mean]
+            return r, g, b
+    except Exception:
+        return (168, 134, 221)  # fallback lavender
 
-        # 1) Resolve inputs (images from the job folder)
-        job_id = RENDERS[render_id]["job_id"]
-        job_dir = TMP_DIR / job_id
-        images = sorted([p for p in job_dir.iterdir() if p.suffix.lower() in {".jpg",".jpeg",".png",".webp",".bmp"}])
+def _radial_gradient_png(size: tuple[int,int], center_color: tuple[int,int,int], out_path: Path):
+    """Create a radial gradient PNG (center color -> darker edge)."""
+    from math import hypot
+    from PIL import Image
+
+    w, h = size
+    cx, cy = w / 2.0, h / 2.0
+    maxd = ( (w/2.0)**2 + (h/2.0)**2 ) ** 0.5
+
+    # Precompute darker edge color (~40% of center)
+    edge = tuple(max(0, int(c * 0.40)) for c in center_color)
+
+    # Build three channels separately for speed
+    r0, g0, b0 = center_color
+    r1, g1, b1 = edge
+
+    # Create blank image
+    img = Image.new("RGB", (w, h))
+    px = img.load()
+    for y in range(h):
+        for x in range(w):
+            t = min(1.0, hypot(x - cx, y - cy) / maxd)  # 0 center -> 1 edge
+            # linear blend
+            r = int(r0 * (1 - t) + r1 * t)
+            g = int(g0 * (1 - t) + g1 * t)
+            b = int(b0 * (1 - t) + b1 * t)
+            px[x, y] = (r, g, b)
+    img.save(out_path)
+
+# =========================
+# Render worker (Option C: gradient background)
+# =========================
+async def _render_worker(render_id: str, out_file: Path):
+    """
+    For each photo:
+      - Build a 1280x720 radial-gradient background from its dominant color.
+      - Scale the photo to FIT inside 1280x720 (no crop, no stretch, no upscale above source).
+      - Center the photo over the gradient.
+    Then:
+      - Chain with xfade (increasing offsets).
+      - Add music + PNG watermark.
+    """
+    try:
+        info = RENDERS[render_id]
+        info["status"] = "processing"; info["progress"] = 5
+        cfg = info["cfg"]; fps = cfg["fps"]; SLIDE = cfg["slide_s"]; XFADE = cfg["xfade_s"]
+
+        job_dir = TMP_DIR / info["job_id"]
+        images = sorted([p for p in job_dir.iterdir() if p.suffix.lower() in ALLOWED_EXTS],
+                        key=lambda p: p.name.lower())
         if not images:
             raise RuntimeError("No images found for this job.")
 
-        # 2) Working temp folder for segments
         work = Path(tempfile.mkdtemp(prefix=f"render_{render_id}_", dir=str(RENDERS_DIR)))
-        seg_paths: list[Path] = []
-        total = len(images)
+        segs: list[Path] = []
 
-        def run_ffmpeg(args):
-            return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        # 3) Make one MP4 segment per image with a gentle center zoom (Ken Burns)
-        frames = int(SLIDE_SECONDS * FPS)
-
+        # --- 1) Per-image segments (gradient bg + fit foreground) ---
         for idx, img in enumerate(images, start=1):
             seg = work / f"seg_{idx:03d}.mp4"
+            bg = work / f"bg_{idx:03d}.png"
 
-            # Fill 1280x720 by scaling UP to cover, then crop, then do a small zoom
+            # Make gradient background
+            base = _dominant_color(img)
+            _radial_gradient_png((1280, 720), base, bg)
+
+            # Two inputs: bg then foreground photo
+            # - Loop each for SLIDE seconds
+            # - Scale fg to fit (no upscale), then overlay centered onto bg
             vf = (
-                "scale=1280:720:force_original_aspect_ratio=increase,"  # fill short side
-                "crop=1280:720,"                                        # trim overflow
-                f"zoompan=z='min(zoom+{ZINCR:.6f},{ZMAX})':"            # gentle zoom
-                "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-                f"d={frames}:fps={FPS}:s=1280x720,"
-                "format=yuv420p,setsar=1"
+                "[1:v]scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease[fg];"
+                "[0:v][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2,"
+                f"fps={fps},format=yuv420p,setsar=1[v]"
             )
-
             cmd = [
                 "ffmpeg", "-y",
-                "-loop", "1", "-t", f"{SLIDE_SECONDS}",
-                "-i", str(img),
-                "-vf", vf,
-                "-r", str(FPS),
-                "-an",
-                "-c:v", "libx264",
+                "-loop", "1", "-t", f"{SLIDE}", "-i", str(bg),
+                "-loop", "1", "-t", f"{SLIDE}", "-i", str(img),
+                "-filter_complex", vf, "-map", "[v]",
+                "-r", str(fps), "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-pix_fmt", "yuv420p",
                 str(seg),
             ]
-            res = await asyncio.to_thread(run_ffmpeg, cmd)
-            if res.returncode != 0:
-                raise RuntimeError(f"FFmpeg segment failed for {img.name}:\n{res.stderr[-2000:]}")
-            seg_paths.append(seg)
-            RENDERS[render_id]["progress"] = 5 + int(60 * idx / total)
+            r = await asyncio.to_thread(_run, cmd)
+            if r.returncode != 0:
+                raise RuntimeError(f"FFmpeg segment failed for {img.name}:\n{r.stderr[-1500:]}")
 
+            segs.append(seg)
+            info["progress"] = 5 + int(60 * idx / max(len(images), 1))
 
-        # 4) If only one image, just move the single segment to output
-        if len(seg_paths) == 1:
-            # re-encode to ensure correct pix_fmt/compat
-            cmd = ["ffmpeg", "-y", "-i", str(seg_paths[0]), "-pix_fmt", "yuv420p", "-r", str(FPS), str(out_file)]
-            res = await asyncio.to_thread(run_ffmpeg, cmd)
-            if res.returncode != 0:
-                raise RuntimeError(f"FFmpeg final failed:\n{res.stderr[:600]}")
-            RENDERS[render_id]["progress"] = 100
-            RENDERS[render_id]["status"] = "done"
-            return
+        # --- 2) Stitch with xfade (increasing offsets) ---
+        if len(segs) == 1:
+            cmd = ["ffmpeg", "-y", "-i", str(segs[0]),
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                   "-pix_fmt", "yuv420p", str(out_file)]
+            r = await asyncio.to_thread(_run, cmd)
+            if r.returncode != 0:
+                raise RuntimeError(f"FFmpeg final (single) failed:\n{r.stderr[-1500:]}")
+        else:
+            cmd = ["ffmpeg", "-y"]
+            for p in segs: cmd += ["-i", str(p)]
+            steps = []
+            last = "[0:v]"
+            for i in range(1, len(segs)):
+                outlbl = f"[v{i}]"
+                offset = i * (SLIDE - XFADE)
+                steps.append(
+                    f"{last}[{i}:v]xfade=transition=fade:duration={XFADE}:offset={offset:.3f},"
+                    "format=yuv420p" + outlbl
+                )
+                last = outlbl
+            filtergraph = ";".join(steps)
+            cmd += ["-filter_complex", filtergraph, "-map", last,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", str(out_file)]
+            r = await asyncio.to_thread(_run, cmd)
+            if r.returncode != 0:
+                raise RuntimeError(f"FFmpeg xfade failed:\n{r.stderr[-2000:]}")
 
-        # 5) Chain with xfade transitions
-        #    offset = SLIDE_SECONDS - XFADE_SECONDS (when the fade starts)
-        offset = max(SLIDE_SECONDS - XFADE_SECONDS, 0.01)
-        # inputs: -i seg1 -i seg2 ...
-        cmd = ["ffmpeg", "-y"]
-        for p in seg_paths:
-            cmd += ["-i", str(p)]
+        # --- 3) Music + PNG watermark (same as before) ---
+        video_only = out_file.with_suffix(".video.mp4")
+        out_file.rename(video_only)
+        final_out = out_file
 
-        # Build filter graph: [0:v][1:v]xfade=... [v1]; [v1][2:v]xfade=... [v2]; ...
-        steps = []
-        last = "[0:v]"
-        for i in range(1, len(seg_paths)):
-            outlbl = f"[v{i}]"
-            steps.append(f"{last}[{i}:v]xfade=transition=fade:duration={XFADE_SECONDS}:offset={offset}{outlbl}")
-            last = outlbl
-        filtergraph = ";".join(steps)
+        N = len(segs)
+        total_seconds = max(N * SLIDE - (N - 1) * XFADE, 0.5)
+        fade_out_start = max(total_seconds - 0.8, 0.0)
 
-        cmd += [
-            "-filter_complex", filtergraph,
-            "-map", last,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-r", str(FPS),
-            str(out_file),
-        ]
+        # Make small watermark PNG on the fly
+        wm_path = None
+        if FREE_TIER:
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                W, H = 420, 56
+                im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                d = ImageDraw.Draw(im)
+                d.rounded_rectangle([0, 0, W, H], radius=12, fill=(0, 0, 0, int(255 * 0.30)))
+                try:
+                    font = ImageFont.truetype("arial.ttf", 28)
+                except Exception:
+                    font = ImageFont.load_default()
+                d.text((16, 14), WATERMARK_TEXT, fill=(255, 255, 255, int(255 * 0.85)), font=font)
+                wm_path = RENDERS_DIR / f"{render_id}_wm.png"
+                im.save(wm_path)
+            except Exception:
+                wm_path = None
 
-        res = await asyncio.to_thread(run_ffmpeg, cmd)
-        if res.returncode != 0:
-            raise RuntimeError(f"FFmpeg xfade failed:\n{res.stderr[:1200]}")
+        if MUSIC_FILE.exists() and wm_path:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_only), "-stream_loop", "-1", "-i", str(MUSIC_FILE), "-i", str(wm_path),
+                "-shortest",
+                "-filter_complex", "[0:v][2:v]overlay=main_w-overlay_w-24:main_h-overlay_h-24[v]",
+                "-map", "[v]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out_start:.2f}:d=0.8",
+                str(final_out),
+            ]
+        elif MUSIC_FILE.exists():
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_only), "-stream_loop", "-1", "-i", str(MUSIC_FILE),
+                "-shortest",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out_start:.2f}:d=0.8",
+                str(final_out),
+            ]
+        elif wm_path:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_only), "-i", str(wm_path),
+                "-filter_complex", "[0:v][1:v]overlay=main_w-overlay_w-24:main_h-overlay_h-24[v]",
+                "-map", "[v]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                str(final_out),
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-i", str(video_only),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                str(final_out),
+            ]
+        r = await asyncio.to_thread(_run, cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"Audio/overlay failed:\n{r.stderr[-1500:]}")
 
-        RENDERS[render_id]["progress"] = 100
-        RENDERS[render_id]["status"] = "done"
+        # Cleanup
+        try: video_only.unlink(missing_ok=True)
+        except Exception: pass
+        try:
+            if 'wm_path' in locals() and wm_path:
+                Path(wm_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        info["progress"] = 100; info["status"] = "done"
 
     except Exception as e:
         RENDERS[render_id]["status"] = "error"
