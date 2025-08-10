@@ -2,33 +2,37 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { pingHealth, uploadFiles, getJob, startRender, fetchRenderStatus, API_URL } from '../lib/api';
 
-const LAVENDER = '#a886ddff';   // brand color you chose
+const LAVENDER = '#a886ddff';
 const DARK_PURPLE = '#20093A';
+const DEFAULT_XFADE = 0.8; // matches backend default
 
 export default function UploadPage() {
-  const [files, setFiles] = useState([]);        // {file, previewUrl, id}
+  const [files, setFiles] = useState([]);
   const [apiOnline, setApiOnline] = useState(null);
+
   const [isUploading, setIsUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [uploadError, setUploadError] = useState('');
-  const [job, setJob] = useState(null);          // {job_id,...}
+  const [job, setJob] = useState(null);
 
-  // NEW: render states
+  // NEW: user control
+  const [slideSeconds, setSlideSeconds] = useState(3.0);
+  const [xfadeSeconds, setXfadeSeconds]   = useState(0.8);
+  
+  // render states
   const [renderId, setRenderId] = useState(null);
-  const [renderStatus, setRenderStatus] = useState(null); // null|queued|processing|done|error
+  const [renderStatus, setRenderStatus] = useState(null);
   const [renderPct, setRenderPct] = useState(0);
   const [renderErr, setRenderErr] = useState('');
   const [downloadUrl, setDownloadUrl] = useState('');
   const pollRef = useRef(null);
 
-  // ping API once
   useEffect(() => {
     const ctrl = new AbortController();
     pingHealth(ctrl.signal).then(setApiOnline).catch(() => setApiOnline(false));
     return () => ctrl.abort();
   }, []);
 
-  // dropzone
   const onDrop = useCallback((accepted) => {
     const mapped = accepted.map((file) => ({
       file,
@@ -36,16 +40,15 @@ export default function UploadPage() {
       id: `${file.name}-${file.size}-${file.lastModified}`,
     }));
     setFiles((prev) => [...prev, ...mapped].slice(0, 25));
-    // reset prior results
     setJob(null); setRenderId(null); setRenderStatus(null);
     setDownloadUrl(''); setRenderErr(''); setUploadError('');
     setUploadPct(0); setRenderPct(0);
   }, []);
+
   const { getRootProps, getInputProps, isDragActive, fileRejections } = useDropzone({
     onDrop, accept: { 'image/*': [] }, maxFiles: 25, multiple: true,
   });
 
-  // cleanup URLs
   useEffect(() => () => files.forEach(f => URL.revokeObjectURL(f.previewUrl)), [files]);
 
   const removeFile = (id) => setFiles((prev) => prev.filter((f) => f.id !== id));
@@ -57,7 +60,6 @@ export default function UploadPage() {
     setUploadPct(0); setRenderPct(0);
   };
 
-  // upload handler
   const handleUpload = async () => {
     if (!files.length || isUploading) return;
     setIsUploading(true);
@@ -74,16 +76,22 @@ export default function UploadPage() {
     }
   };
 
-  // start render
+  const estimateSeconds = (n, slide, xfade) => {
+    if (!n) return 0;
+    return Math.max(n * slide - (n - 1) * xfade, 0).toFixed(1);
+  };
+
   const handleStartRender = async () => {
     if (!job?.job_id || renderStatus === 'processing' || renderStatus === 'queued') return;
     setRenderErr(''); setRenderPct(0);
     try {
-      const r = await startRender(job.job_id);
+      const r = await startRender(job.job_id, {
+        slide_seconds: slideSeconds,
+        xfade_seconds: Math.min(xfadeSeconds, slideSeconds - 0.1),
+      });  // <-- send the value
       setRenderId(r.render_id);
       setRenderStatus(r.status || 'queued');
 
-      // start polling every 500ms
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(async () => {
         try {
@@ -96,16 +104,13 @@ export default function UploadPage() {
             pollRef.current = null;
             if (s.error) setRenderErr(s.error);
           }
-        } catch {
-          // transient fetch error — ignore; next tick will retry
-        }
+        } catch { /* ignore transient errors */ }
       }, 500);
     } catch (e) {
       setRenderErr(e.message || 'Could not start render');
     }
   };
 
-  // stop polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   return (
@@ -148,6 +153,41 @@ export default function UploadPage() {
           </div>
         </section>
 
+        {/* NEW: Controls */}
+        <div className="mt-4 bg-white rounded-xl p-4 shadow grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="flex items-center gap-4">
+            <label className="text-sm font-medium">
+              Time per photo: <span className="font-bold">{slideSeconds.toFixed(1)}s</span>
+            </label>
+            <input
+              type="range" min="1" max="8" step="0.1"
+              value={slideSeconds}
+              onChange={(e) => setSlideSeconds(parseFloat(e.target.value))}
+              className="w-64"
+            />
+          </div>
+          <div className="flex items-center gap-4">
+            <label className="text-sm font-medium">
+              Cross-fade: <span className="font-bold">{xfadeSeconds.toFixed(1)}s</span>
+            </label>
+            <input
+              type="range" min="0.2" max={Math.max(0.3, slideSeconds - 0.1)} step="0.1"
+              value={Math.min(xfadeSeconds, slideSeconds - 0.1)}
+              onChange={(e) => setXfadeSeconds(parseFloat(e.target.value))}
+              className="w-64"
+            />
+          </div>
+          <div className="col-span-1 md:col-span-2 text-xs opacity-70">
+            Estimated video length: <b>
+              {files.length
+                ? Math.max(files.length * slideSeconds - (files.length - 1) * Math.min(xfadeSeconds, slideSeconds - 0.1), 0).toFixed(1)
+                : '0.0'}
+              s
+            </b>
+          </div>
+        </div>
+
+
         {files.length > 0 && (
           <>
             <div className="flex items-center justify-between mt-6 gap-3">
@@ -182,7 +222,6 @@ export default function UploadPage() {
               </div>
             </div>
 
-            {/* Upload progress */}
             {(isUploading || uploadPct > 0) && (
               <div className="mt-3 bg-white rounded-xl p-3 shadow">
                 <div className="text-sm mb-1">Upload progress: {uploadPct}%</div>
@@ -193,7 +232,6 @@ export default function UploadPage() {
               </div>
             )}
 
-            {/* Render progress */}
             {(renderStatus && renderStatus !== 'done') && (
               <div className="mt-3 bg-white rounded-xl p-3 shadow">
                 <div className="text-sm mb-1">Render status: {renderStatus} — {renderPct}%</div>
@@ -204,7 +242,6 @@ export default function UploadPage() {
               </div>
             )}
 
-            {/* Thumbnails */}
             <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 mt-4">
               {files.map((f) => (
                 <li key={f.id} className="bg-white rounded-xl overflow-hidden shadow">
@@ -228,7 +265,6 @@ export default function UploadPage() {
           </>
         )}
 
-        {/* Download card */}
         {renderStatus === 'done' && downloadUrl && (
           <div className="mt-6 bg-white rounded-xl p-4 shadow">
             <div className="font-semibold">Render complete</div>

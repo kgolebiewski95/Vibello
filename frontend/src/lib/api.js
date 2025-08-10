@@ -39,15 +39,14 @@ export async function getJob(jobId) {
   return res.json();
 }
 
-// --- NEW: render helpers ---
-export async function startRender(jobId) {
+export async function startRender(jobId, opts = {}) {
   const res = await fetch(`${API_URL}/api/render`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ job_id: jobId }),
+    body: JSON.stringify({ job_id: jobId, ...opts }), // <-- send slide_seconds & xfade_seconds
   });
   if (!res.ok) throw new Error('Render start failed');
-  return res.json(); // {render_id, status}
+  return res.json();
 }
 
 export async function fetchRenderStatus(renderId) {
